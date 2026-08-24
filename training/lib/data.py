@@ -330,7 +330,18 @@ def stratified_sample(
         ais = [r for r in pooled if r["label"] == 1]
         want_human = int(want * spec.human_share)
         n_human = min(len(humans), want_human)
-        n_ai = min(len(ais), want - want_human) 
+
+        # Preserve the requested ratio when one class runs out, instead of
+        # letting the abundant class fill the gap. Human text is the scarce
+        # class by an order of magnitude, so filling the shortfall with AI is
+        # what silently turns a 50/50 request into a 0.62 skew — and a skewed
+        # sample shifts the decision threshold and poisons the calibrator.
+        # Fewer, balanced rows beat more, skewed ones.
+        if spec.human_share > 0:
+            paired = int(round(n_human * (1.0 - spec.human_share) / spec.human_share))
+            n_ai = min(len(ais), paired)
+        else:
+            n_ai = min(len(ais), want)
 
         # Report a shortfall rather than silently returning a skewed frame.
         # RAID holds on the order of 15k human documents against millions of
@@ -347,9 +358,11 @@ def stratified_sample(
                 f"actually support.",
                 flush=True,
             )
-        if n_ai < want - n_human:
+        if n_human + n_ai < want:
             print(
-                f"  [{group}] short on AI rows: {n_ai:,} of {want - n_human:,}",
+                f"  [{group}] returning {n_human + n_ai:,} balanced rows rather "
+                f"than {want:,} skewed ones ({n_human:,} human + {n_ai:,} AI). "
+                f"The human class is the binding constraint.",
                 flush=True,
             )
 

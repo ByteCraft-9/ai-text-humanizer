@@ -151,6 +151,42 @@ frame_b = build_dataset(DATA / "train_b.parquet", spec_b, include_adversarial=Fa
 # Gate: class balance and domain coverage must be verified before training
 # (PRD 18, phase 1). A skewed sample produces a model that looks fine on its
 # own validation split and fails on everything else.
+#
+# The sampler already balances at selection time, but human text is the
+# scarce class by an order of magnitude and the exact mix depends on what the
+# stream happened to yield. This is the safety net: it downsamples the
+# majority class within each adversarial group, so both the label balance and
+# the adversarial share hold. A no-op when the frames are already balanced.
+import pandas as pd
+
+def rebalance(frame, name, seed=0):
+    parts = []
+    for is_adv, group in frame.groupby("adversarial", sort=False):
+        humans = group[group["label"] == 0]
+        ais = group[group["label"] == 1]
+        n = min(len(humans), len(ais))
+        tag = "adversarial" if is_adv else "clean"
+        if n == 0:
+            print(f"  [{name}/{tag}] one class is empty — kept unchanged")
+            parts.append(group)
+            continue
+        if len(humans) != len(ais):
+            print(f"  [{name}/{tag}] {len(humans):,} human / {len(ais):,} AI -> {n:,} each")
+        parts.append(pd.concat([humans.sample(n=n, random_state=seed),
+                                ais.sample(n=n, random_state=seed)]))
+    out = pd.concat(parts).sample(frac=1.0, random_state=seed).reset_index(drop=True)
+    if len(out) != len(frame):
+        print(f"  [{name}] {len(frame):,} @ {frame['label'].mean():.3f} -> "
+              f"{len(out):,} @ {out['label'].mean():.3f}")
+    return out
+
+frame_a = rebalance(frame_a, "A")
+frame_b = rebalance(frame_b, "B")
+
+# Stages 2 and 3 read the Parquet files, not these variables — write them back.
+frame_a.to_parquet(DATA / "train_a.parquet", index=False)
+frame_b.to_parquet(DATA / "train_b.parquet", index=False)
+
 for name, frame in (("A", frame_a), ("B", frame_b)):
     print(f"--- Model {name}: {len(frame):,} rows")
     print(frame["label"].value_counts(normalize=True).round(3).to_dict())
