@@ -1,0 +1,6 @@
+# Pinned so a Vercel rebuild cannot silently change inference behaviour.
+# Bundle budget (PRD 9.1): onnxruntime ~50 MB + numpy ~25 MB + tokenizers ~5 MB
+# leaves ~420 MB of the 500 MB limit for weights.
+numpy==2.2.2
+onnxruntime==1.20.1
+tokenizers==0.21.0

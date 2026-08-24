@@ -1,0 +1,156 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    --bg: #fbfbfa;
+    --surface: #ffffff;
+    --surface-sunken: #f4f4f2;
+    --border: #e2e2dd;
+    --border-strong: #c9c9c2;
+    --text: #1b1b18;
+    --text-muted: #64645c;
+    --accent: #1f5f5b;
+    --accent-soft: #e6f0ef;
+    --warn: #8a5a12;
+    --warn-soft: #fdf3e2;
+    --danger: #9f2b3d;
+  }
+
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #14140f;
+      --surface: #1c1c17;
+      --surface-sunken: #232320;
+      --border: #33332c;
+      --border-strong: #4a4a41;
+      --text: #f0f0eb;
+      --text-muted: #a3a399;
+      --accent: #6fb5ae;
+      --accent-soft: #1d2f2e;
+      --warn: #e0b062;
+      --warn-soft: #2c2415;
+      --danger: #e08696;
+    }
+  }
+
+  html {
+    color-scheme: light dark;
+  }
+
+  body {
+    background: var(--bg);
+    color: var(--text);
+    -webkit-font-smoothing: antialiased;
+  }
+
+  /* Visible focus everywhere — full keyboard navigation is a requirement
+     (PRD 15.3), and the default ring disappears against our surfaces. */
+  :focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+    border-radius: 3px;
+  }
+}
+
+@layer components {
+  .surface {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+  }
+
+  .muted {
+    color: var(--text-muted);
+  }
+
+  /*
+   * Heatmap bands. Colour is never the only carrier of meaning: each band
+   * also gets a distinct underline pattern and every span is labelled with
+   * its numeric score for screen readers (WCAG 2.1 AA, PRD 15.3).
+   */
+  .band {
+    border-radius: 2px;
+    padding: 1px 0;
+    text-decoration-line: underline;
+    text-decoration-thickness: 2px;
+    text-underline-offset: 3px;
+    transition: background-color 120ms ease;
+  }
+
+  .band-human {
+    background: transparent;
+    text-decoration-line: none;
+  }
+
+  .band-low {
+    background: color-mix(in srgb, #65a30d 12%, transparent);
+    text-decoration-style: dotted;
+    text-decoration-color: #65a30d;
+  }
+
+  .band-mid {
+    background: color-mix(in srgb, #ca8a04 16%, transparent);
+    text-decoration-style: dashed;
+    text-decoration-color: #ca8a04;
+  }
+
+  .band-high {
+    background: color-mix(in srgb, #ea580c 18%, transparent);
+    text-decoration-style: solid;
+    text-decoration-color: #ea580c;
+  }
+
+  .band-ai {
+    background: color-mix(in srgb, #be123c 20%, transparent);
+    text-decoration-style: double;
+    text-decoration-color: #be123c;
+  }
+
+  .btn {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 0.5rem;
+    border-radius: 8px;
+    border: 1px solid var(--border-strong);
+    padding: 0.55rem 1rem;
+    font-size: 0.9rem;
+    font-weight: 500;
+    background: var(--surface);
+    color: var(--text);
+    cursor: pointer;
+    transition: background-color 120ms ease, border-color 120ms ease;
+  }
+
+  .btn:hover:not(:disabled) {
+    background: var(--surface-sunken);
+  }
+
+  .btn:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+  }
+
+  .btn-primary {
+    background: var(--accent);
+    border-color: var(--accent);
+    color: #ffffff;
+  }
+
+  .btn-primary:hover:not(:disabled) {
+    filter: brightness(1.08);
+    background: var(--accent);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}

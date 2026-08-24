@@ -1,0 +1,42 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "rewrites": [{ "source": "/api/py/:path*", "destination": "/api/:path*" }],
+  "functions": {
+    "api/detect.py": {
+      "memory": 2048,
+      "maxDuration": 60,
+      "includeFiles": "models/{detector_*,fusion_*}"
+    },
+    "api/perplexity.py": {
+      "memory": 2048,
+      "maxDuration": 60,
+      "includeFiles": "models/{distilgpt2_*,gpt2_*}"
+    },
+    "api/score.py": {
+      "memory": 2048,
+      "maxDuration": 60,
+      "includeFiles": "models/{detector_b_*,minilm_*,distilgpt2_*,gpt2_*,fusion_b*}"
+    },
+    "api/health.py": {
+      "memory": 512,
+      "maxDuration": 10
+    },
+    "app/api/humanize/route.ts": {
+      "maxDuration": 300
+    }
+  },
+  "headers": [
+    {
+      "source": "/(.*)",
+      "headers": [
+        { "key": "X-Content-Type-Options", "value": "nosniff" },
+        { "key": "Referrer-Policy", "value": "no-referrer" },
+        { "key": "X-Frame-Options", "value": "DENY" },
+        {
+          "key": "Permissions-Policy",
+          "value": "camera=(), microphone=(), geolocation=(), interest-cohort=()"
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,13 @@
+# Training only. Not installed on Vercel — see requirements.txt for the
+# runtime dependencies, which are deliberately far smaller.
+torch>=2.4
+transformers>=4.44
+datasets>=2.20
+sentencepiece>=0.2
+pandas>=2.2
+pyarrow>=17
+numpy>=2.0
+onnx>=1.16
+onnxruntime>=1.20
+optimum[onnxruntime]>=1.22
+huggingface-hub>=0.25

@@ -1,0 +1,27 @@
+# Node
+node_modules/
+.next/
+out/
+next-env.d.ts
+*.tsbuildinfo
+
+# Environment
+.env
+.env.local
+.vercel
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# Model weights are fetched at build time from Hugging Face, never committed:
+# GitHub's free LFS allowance is 1 GB storage and 1 GB bandwidth per month,
+# which repeated deploys would exhaust within days.
+models/*
+!models/.gitkeep
+
+# Copied from node_modules by scripts/copy-pdf-worker.mjs
+public/pdf.worker.min.mjs
+
+.DS_Store
