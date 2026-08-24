@@ -18,6 +18,7 @@ Model B trains without them, which is what makes it a faithful surrogate for
 third-party detectors that have no such hardening.
 """
 
+import itertools
 from __future__ import annotations
 
 import sys
@@ -329,7 +330,7 @@ def stratified_sample(
         ais = [r for r in pooled if r["label"] == 1]
         want_human = int(want * spec.human_share)
         n_human = min(len(humans), want_human)
-        n_ai = min(len(ais), want - n_human)
+        n_ai = min(len(ais), want - want_human) 
 
         # Report a shortfall rather than silently returning a skewed frame.
         # RAID holds on the order of 15k human documents against millions of
@@ -419,13 +420,13 @@ def build_dataset(
     spec = spec or SampleSpec()
 
     def stream() -> Iterator[dict]:
-        count = 0
-        for row in load_raid(seed=spec.seed, buffer_size=spec.shuffle_buffer):
-            yield row
-            count += 1
-            if limit_raid and count >= limit_raid:
-                break
-        yield from load_dactyl(seed=spec.seed, buffer_size=spec.shuffle_buffer)
+        raid_iter = load_raid(seed=spec.seed, buffer_size=spec.shuffle_buffer)
+        dactyl_iter = load_dactyl(seed=spec.seed, buffer_size=spec.shuffle_buffer)
+        for r, d in itertools.zip_longest(raid_iter, dactyl_iter):
+            if r is not None:
+                yield r
+            if d is not None:
+                yield d
 
     print(
         f"Sampling up to {spec.total:,} rows, reading at most "
