@@ -154,7 +154,8 @@ Everything free: Kaggle gives ~30 GPU-hours/week; a DeBERTa-v3-base run needs
 
 ```
 training/
-├── 01_build_dataset.ipynb    RAID + DACTYL → 400k balanced rows + features
+├── kaggle_train_all.ipynb    ← every stage in one file. Upload this one.
+├── 01_build_dataset.ipynb    RAID + DACTYL → balanced rows + features
 ├── 02_train_model_a.ipynb    strict detector (adversarial rows included)
 ├── 03_train_model_b.ipynb    surrogate      (adversarial rows excluded)
 ├── 04_export_onnx.ipynb      ONNX opset 17 → INT8 → parity + size gates
@@ -162,7 +163,20 @@ training/
 └── lib/                      the actual pipeline — readable, diffable, testable
 ```
 
-Regenerate the notebooks after editing `build_notebooks.py`:
+**Upload `kaggle_train_all.ipynb`** — it contains all five stages with the
+setup cell deduplicated. In Kaggle's settings panel set **Accelerator** to GPU,
+**Internet** to On, and **Persistence** to *Files only*. That last one is what
+lets one notebook carry the whole run: `/kaggle/working` survives between
+sessions, so each stage finds the previous stage's output.
+
+Leave `SMOKE_TEST = True` for the first pass. It runs the entire chain on
+5,000 rows in under an hour. You get 30 GPU-hours a week and a full run costs
+8–16 of them, so verify the pipeline before committing to it.
+
+Stage 5 detects its missing evaluation splits and skips cleanly, so a
+"Save & Run All" still finishes green with stages 1–4 complete.
+
+Regenerate all six notebooks after editing `build_notebooks.py`:
 
 ```bash
 python training/build_notebooks.py
