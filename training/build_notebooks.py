@@ -37,6 +37,12 @@ SETUP = f'''\
 import sys, os
 from pathlib import Path
 
+# Must be set before torch is imported anywhere — PyTorch reads it when CUDA
+# first initialises. Reduces the fragmentation that turns "enough memory" into
+# an out-of-memory error hours into a run.
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
 # Change this if you forked the repo. Public repo => no token needed.
 GIT_URL = "{DEFAULT_GIT_URL}"
 
@@ -269,6 +275,17 @@ the rewrite against the detector meant to catch it is how a product ends up
 grading its own homework.
 
 **Needs GPU.** 4–8 hours on a T4 at full size. Checkpoints every 500 steps.
+
+DeBERTa-v3's disentangled attention builds three attention matrices per layer
+where a standard transformer builds one, so it is far more memory-hungry than
+its parameter count suggests. Two settings make it fit a 14.5 GB T4, both on
+by default: gradient checkpointing, and dynamic padding to each batch's own
+longest sequence rather than to `max_length`.
+
+If it still runs out of memory, halve `batch_size` and double
+`accumulation_steps` — that holds the effective batch, and therefore the
+optimisation trajectory, constant. Prefer that over cutting `max_length`,
+which would stop a full 800-token chunk fitting in one forward pass.
 """
 
 STAGE2_CELLS = [

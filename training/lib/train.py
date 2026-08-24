@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -39,6 +40,18 @@ class TrainConfig:
     checkpoint_every: int = 500
     eval_every: int = 2_000
     seed: int = 20260824
+    #: Recompute activations in the backward pass instead of storing them.
+    #: Costs roughly 30% throughput and saves several gigabytes. Required on a
+    #: 14.5 GB T4: DeBERTa-v3's disentangled attention builds three attention
+    #: matrices per layer instead of one, so at 768 tokens the stored
+    #: activations alone exceed the card.
+    gradient_checkpointing: bool = True
+    #: Pad each batch to its own longest sequence rather than to max_length.
+    #: The corpus median is ~210 words (~280 tokens) against a 768 ceiling, so
+    #: fixed padding spends most of its memory and compute on padding.
+    dynamic_padding: bool = True
+    #: Round padded length up to a multiple of this; tensor cores want 8.
+    pad_to_multiple_of: int = 8
     # Standardisation statistics from the training split; written alongside
     # the checkpoint so inference can use the same ones.
     feature_mean: list[float] | None = None
@@ -70,19 +83,52 @@ class TextDataset(Dataset):
         return len(self.texts)
 
     def __getitem__(self, index: int) -> dict:
+        # Deliberately unpadded — `collate` pads each batch to its own longest
+        # sequence. Padding here to max_length would make every batch 768
+        # tokens wide regardless of content.
         encoded = self.tokenizer(
             self.texts[index],
             truncation=True,
             max_length=self.max_length,
-            padding="max_length",
+        )
+        return {
+            "input_ids": encoded["input_ids"],
+            "attention_mask": encoded["attention_mask"],
+            "features": self.features[index],
+            "label": self.labels[index],
+        }
+
+
+def make_collate(tokenizer, pad_to_multiple_of: int = 8):
+    """Pad a batch to its own longest sequence.
+
+    With a corpus median around 280 tokens against a 768 ceiling this cuts
+    attention memory by roughly the square of the ratio, which is what makes
+    the run fit alongside DeBERTa-v3's triple attention matrices.
+    """
+
+    def collate(batch: list[dict]) -> dict:
+        padded = tokenizer.pad(
+            {
+                "input_ids": [item["input_ids"] for item in batch],
+                "attention_mask": [item["attention_mask"] for item in batch],
+            },
+            padding=True,
+            pad_to_multiple_of=pad_to_multiple_of,
             return_tensors="pt",
         )
         return {
-            "input_ids": encoded["input_ids"].squeeze(0),
-            "attention_mask": encoded["attention_mask"].squeeze(0),
-            "features": torch.from_numpy(self.features[index]),
-            "label": torch.tensor(self.labels[index]),
+            "input_ids": padded["input_ids"],
+            "attention_mask": padded["attention_mask"],
+            "features": torch.from_numpy(
+                np.stack([item["features"] for item in batch])
+            ),
+            "label": torch.from_numpy(
+                np.stack([item["label"] for item in batch])
+            ),
         }
+
+    return collate
 
 
 def _latest_checkpoint(directory: Path) -> Path | None:
@@ -142,8 +188,23 @@ def train(
     torch.manual_seed(config.seed)
     np.random.seed(config.seed)
 
+    # The dataset tokenizes inside worker processes; the fast tokenizer's own
+    # thread pool on top of that just contends.
+    os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+
+    # PYTORCH_CUDA_ALLOC_CONF is read when CUDA first initialises, so setting
+    # it here only helps if nothing has touched the GPU yet. The notebook
+    # setup cell sets it before torch is ever imported, which is the place it
+    # reliably takes effect; this is a fallback for direct callers.
+    os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"device: {device}")
+    if device == "cuda":
+        name = torch.cuda.get_device_name(0)
+        total = torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
+        free = torch.cuda.mem_get_info()[0] / (1024 ** 3)
+        print(f"  {name}, {total:.1f} GiB total, {free:.1f} GiB free")
 
     # Standardisation comes from the training split only — computing it over
     # validation too would leak.
@@ -156,7 +217,21 @@ def train(
 
     tokenizer = AutoTokenizer.from_pretrained(config.backbone)
     model = Detector(DetectorConfig(backbone=config.backbone, max_length=config.max_length))
+
+    if config.gradient_checkpointing:
+        # use_reentrant=False is required for checkpointing to co-operate with
+        # AMP and with inputs that do not require grad.
+        model.backbone.gradient_checkpointing_enable(
+            gradient_checkpointing_kwargs={"use_reentrant": False}
+        )
+        model.backbone.config.use_cache = False
+        print("  gradient checkpointing: on")
+
     model.to(device)
+
+    collate = make_collate(tokenizer, config.pad_to_multiple_of) if config.dynamic_padding else None
+    if config.dynamic_padding:
+        print("  dynamic padding: on")
 
     train_loader = DataLoader(
         TextDataset(train_frame, tokenizer, feature_columns, config.max_length, feature_mean, feature_std),
@@ -165,12 +240,15 @@ def train(
         num_workers=2,
         pin_memory=device == "cuda",
         drop_last=True,
+        collate_fn=collate,
     )
     validation_loader = DataLoader(
         TextDataset(validation_frame, tokenizer, feature_columns, config.max_length, feature_mean, feature_std),
+        # Evaluation runs under no_grad, so it has room for a wider batch.
         batch_size=config.batch_size * 2,
         shuffle=False,
         num_workers=2,
+        collate_fn=collate,
     )
 
     criterion = TwoWayPartialAUROCLoss(alpha=0.05, beta=0.80)
@@ -200,17 +278,40 @@ def train(
     started = time.time()
     model.train()
 
+    oom_skipped = 0
+
     for epoch in range(config.epochs):
         for i, batch in enumerate(train_loader):
-            with torch.amp.autocast("cuda", enabled=config.fp16 and device == "cuda"):
-                logits = model(
-                    batch["input_ids"].to(device),
-                    batch["attention_mask"].to(device),
-                    batch["features"].to(device),
-                )
-                loss = criterion(logits, batch["label"].to(device)) / config.accumulation_steps
+            try:
+                with torch.amp.autocast("cuda", enabled=config.fp16 and device == "cuda"):
+                    logits = model(
+                        batch["input_ids"].to(device),
+                        batch["attention_mask"].to(device),
+                        batch["features"].to(device),
+                    )
+                    loss = criterion(logits, batch["label"].to(device)) / config.accumulation_steps
 
-            scaler.scale(loss).backward()
+                scaler.scale(loss).backward()
+            except torch.cuda.OutOfMemoryError:
+                # One unusually long batch must not end an eight-hour run.
+                # Drop it, reclaim, carry on — but stop if it keeps happening,
+                # because then the configuration genuinely does not fit.
+                oom_skipped += 1
+                optimizer.zero_grad(set_to_none=True)
+                del batch
+                torch.cuda.empty_cache()
+                if oom_skipped > 25:
+                    raise RuntimeError(
+                        f"Ran out of GPU memory {oom_skipped} times — this "
+                        f"configuration does not fit. Halve batch_size to "
+                        f"{max(1, config.batch_size // 2)} and double "
+                        f"accumulation_steps to {config.accumulation_steps * 2} "
+                        f"to keep the same effective batch, or lower "
+                        f"max_length from {config.max_length}."
+                    ) from None
+                if oom_skipped % 5 == 1:
+                    print(f"  OOM on one batch (skipped {oom_skipped} so far)", flush=True)
+                continue
 
             if (i + 1) % config.accumulation_steps != 0:
                 continue
@@ -252,6 +353,9 @@ def train(
                 metrics["step"] = step
                 history.append(metrics)
                 print(f"  eval {metrics}", flush=True)
+
+    if oom_skipped:
+        print(f"\n{oom_skipped} batch(es) were skipped on out-of-memory.")
 
     final = evaluate(model, validation_loader, device)
     history.append({**final, "step": step, "final": True})
