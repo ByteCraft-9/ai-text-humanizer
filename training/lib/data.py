@@ -18,13 +18,13 @@ Model B trains without them, which is what makes it a faithful surrogate for
 third-party detectors that have no such hardening.
 """
 
-import itertools
 from __future__ import annotations
 
 import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterator
+import itertools
 
 import numpy as np
 import pandas as pd
