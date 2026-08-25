@@ -32,7 +32,7 @@ DEFAULT_GIT_URL = "https://github.com/ByteCraft-9/ai-text-humanizer.git"
 SETUP = f'''\
 # Setup. Run once per session — everything below depends on it.
 !pip install -q "transformers>=4.44" "datasets>=2.20" sentencepiece onnx onnxruntime \\
-    "optimum[onnxruntime]" pyarrow
+    "optimum[onnxruntime]" pyarrow google-api-python-client google-auth
 
 import sys, os
 from pathlib import Path
@@ -94,6 +94,64 @@ if not SMOKE_TEST:
 '''
 
 
+STORE_CELL = '''\
+# ---------------------------------------------------------------------------
+# Where work survives the session ending. Configure this before running.
+# ---------------------------------------------------------------------------
+#
+# Kaggle wipes /kaggle/working when a session ends or times out. Without a
+# remote store, a run that dies at hour eight leaves nothing behind. With one,
+# the dataset and the newest checkpoint are pulled back automatically and
+# training continues from the step it reached.
+#
+# Fill in ONE of the two. Leaving both blank runs local-only, which is fine
+# for a smoke test and a bad idea for a real run.
+
+# --- Option A: Google Drive (best for checkpoints) -------------------------
+# Uploads replace the file in place, so syncing a 2 GB checkpoint forty times
+# costs 2 GB rather than 80 GB.
+#
+# One-time setup:
+#   1. console.cloud.google.com -> new project -> enable the Drive API
+#   2. Create a service account, then create a JSON key for it
+#   3. In Drive, make a folder and share it with the service account's
+#      client_email (from the JSON) as Editor. A service account has its own
+#      Drive with zero quota, so it can only write into a folder you shared
+#      with it — this is the step people miss.
+#   4. Folder id is the last part of drive.google.com/drive/folders/<THIS>
+#   5. Upload the JSON to Kaggle as a PRIVATE dataset and point at it below
+DRIVE_FOLDER_ID = ""   # e.g. "1AbC..."
+DRIVE_KEY_PATH  = ""   # e.g. "/kaggle/input/gdrive-key/service_account.json"
+
+# --- Option B: Hugging Face Hub (easiest) ----------------------------------
+# Only needs a token: Add-ons -> Secrets -> add one named HF_TOKEN.
+# The Hub is git-backed and keeps every revision, so repeated multi-gigabyte
+# checkpoint pushes accumulate history. Raise remote_sync_minutes if you use
+# this for checkpoints.
+CHECKPOINT_REPO = ""   # e.g. "ByteCraft-9/ai-detector-checkpoints"
+
+import os
+
+if DRIVE_FOLDER_ID and DRIVE_KEY_PATH:
+    os.environ["DRIVE_FOLDER_ID"] = DRIVE_FOLDER_ID
+    os.environ["DRIVE_SERVICE_ACCOUNT_JSON"] = DRIVE_KEY_PATH
+elif CHECKPOINT_REPO:
+    os.environ["CHECKPOINT_REPO"] = CHECKPOINT_REPO
+    try:
+        from kaggle_secrets import UserSecretsClient
+        os.environ["HF_TOKEN"] = UserSecretsClient().get_secret("HF_TOKEN")
+    except Exception as exc:
+        print(f"Could not read the HF_TOKEN secret: {exc}")
+
+from lib.store import build_store
+STORE = build_store()
+
+if STORE.__class__.__name__ == "NullStore":
+    print("\\nNothing will survive this session ending. Fine for a smoke test;"
+          "\\nconfigure a store above before starting a real run.")
+'''
+
+
 def markdown(text: str) -> dict:
     return {"cell_type": "markdown", "metadata": {}, "source": text.splitlines(keepends=True)}
 
@@ -146,12 +204,17 @@ from pathlib import Path
 from lib.data import SampleSpec, build_dataset, feature_statistics
 
 SPEC = SampleSpec(total=SAMPLE_ROWS, adversarial_share=0.15, human_share=0.5)
-frame_a = build_dataset(DATA / "train_a.parquet", SPEC, include_adversarial=True)
+
+# Reuses a local Parquet if present, else pulls it from the store, else builds
+# it. Re-running this cell after a wiped session costs seconds, not hours.
+frame_a = build_dataset(DATA / "train_a.parquet", SPEC,
+                        include_adversarial=True, store=STORE)
 '''),
     code('''\
 spec_b = SampleSpec(total=SAMPLE_ROWS, adversarial_share=0.0, human_share=0.5,
                     seed=SPEC.seed + 1)
-frame_b = build_dataset(DATA / "train_b.parquet", spec_b, include_adversarial=False)
+frame_b = build_dataset(DATA / "train_b.parquet", spec_b,
+                        include_adversarial=False, store=STORE)
 '''),
     code('''\
 # Gate: class balance and domain coverage must be verified before training
@@ -250,12 +313,16 @@ config___TAG__ = TrainConfig(
     fp16=True,
 )
 
-# Checkpoints land in WORK/model___TAG__ every 500 steps and resume
-# automatically. If the session dies, just re-run this cell.
+# Checkpoints land in WORK/model___TAG__ every 500 steps, and every
+# remote_sync_minutes the newest one is pushed to STORE. On startup this looks
+# for a local checkpoint, then a remote one, and fast-forwards to the step it
+# reached — so if the session dies, run the notebook from the top again and
+# training picks up where it stopped.
 model___TAG__, report___TAG__ = train(
     training___TAG__, validation___TAG__, list(FEATURE_NAMES),
     output_dir=WORK / "model___TAG__",
     config=config___TAG__,
+    store=STORE,
 )
 '''
 
@@ -366,7 +433,14 @@ from lib.model import Detector, DetectorConfig
 
 def load(tag):
     path = WORK / f"model_{tag}" / "final.pt"
-    assert path.is_file(), f"{path} missing — run stage {'2' if tag == 'a' else '3'} first"
+    if not path.is_file():
+        # A wiped session loses /kaggle/working; training pushed this file to
+        # the store precisely so stage 4 does not require retraining.
+        STORE.pull(f"model_{tag}-final.pt", path)
+    assert path.is_file(), (
+        f"{path} missing and not in the store — run stage "
+        f"{'2' if tag == 'a' else '3'} first"
+    )
     state = torch.load(path, map_location="cpu")
     cfg = state["config"]
     model = Detector(DetectorConfig(backbone=cfg["backbone"], max_length=cfg["max_length"]))
@@ -616,6 +690,20 @@ left off.
 
 Phone-verify your Kaggle account first, or you get neither GPU nor Internet.
 
+## Configure a checkpoint store first
+
+Kaggle wipes `/kaggle/working` when a session ends. Persistence helps between
+*interactive* sessions, but a hard timeout or an expired session takes
+everything — an eight-hour run leaves nothing behind.
+
+The store cell below fixes that. Point it at Google Drive or a Hugging Face
+repo, and the dataset and newest checkpoint are pushed off-machine as they are
+produced. On the next run everything is pulled back and training resumes at
+the step it reached, so recovering from a dead session means running the
+notebook from the top again.
+
+Do this before starting a real run. Local-only is fine for a smoke test.
+
 ## How to run it
 
 **First pass: leave `SMOKE_TEST = True`.** It runs the entire chain on 5,000
@@ -649,7 +737,14 @@ its section before relying on any accuracy number.
 
 
 def build_stage_notebook(title_md: str, cells: list[dict], tail: list[dict] | None = None) -> list[dict]:
-    return [markdown(title_md), code(SETUP), code(RUN_CONFIG), *cells, *(tail or [])]
+    return [
+        markdown(title_md),
+        code(SETUP),
+        code(RUN_CONFIG),
+        code(STORE_CELL),
+        *cells,
+        *(tail or []),
+    ]
 
 
 NOTEBOOKS: dict[str, list[dict]] = {
@@ -667,6 +762,7 @@ NOTEBOOKS["kaggle_train_all.ipynb"] = [
     markdown(MEGA_INTRO),
     code(SETUP),
     code(RUN_CONFIG),
+    code(STORE_CELL),
     markdown("---\n" + STAGE1_INTRO),
     *STAGE1_CELLS,
     markdown("---\n" + STAGE2_INTRO),

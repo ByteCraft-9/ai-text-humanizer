@@ -22,6 +22,7 @@ from torch.utils.data import DataLoader, Dataset
 
 from .losses import TwoWayPartialAUROCLoss, partial_auroc, tpr_at_fpr
 from .model import Detector, DetectorConfig
+from .store import FileStore, NullStore
 
 FEATURE_COLUMNS: list[str] | None = None  # set by TextDataset on first use
 
@@ -52,6 +53,11 @@ class TrainConfig:
     dynamic_padding: bool = True
     #: Round padded length up to a multiple of this; tensor cores want 8.
     pad_to_multiple_of: int = 8
+    #: Minutes between pushes of the newest checkpoint to the remote store.
+    #: Local checkpoints stay frequent; only the off-machine copy is paced,
+    #: because that one costs bandwidth. At 30 minutes a killed session loses
+    #: at most half an hour of work.
+    remote_sync_minutes: float = 30.0
     # Standardisation statistics from the training split; written alongside
     # the checkpoint so inference can use the same ones.
     feature_mean: list[float] | None = None
@@ -180,11 +186,24 @@ def train(
     feature_columns: list[str],
     output_dir: Path,
     config: TrainConfig | None = None,
+    store: FileStore | None = None,
 ) -> tuple[Detector, dict]:
+    """Train one detector, resuming from wherever the last run stopped.
+
+    `store` survives the container. Without it a killed Kaggle session takes
+    the whole run with it; with it, the loop pulls the newest checkpoint back
+    on startup and carries on from that step.
+    """
     from transformers import AutoTokenizer, get_linear_schedule_with_warmup
 
     config = config or TrainConfig()
+    store = store or NullStore()
     output_dir.mkdir(parents=True, exist_ok=True)
+
+    # A fixed remote name so backends that overwrite in place (Drive) do not
+    # accumulate a copy per sync. The step lives inside the file.
+    remote_checkpoint = f"{output_dir.name}-checkpoint.pt"
+    remote_final = f"{output_dir.name}-final.pt"
     torch.manual_seed(config.seed)
     np.random.seed(config.seed)
 
@@ -265,23 +284,55 @@ def train(
 
     start_step = 0
     resume = _latest_checkpoint(output_dir)
+
+    if resume is None:
+        # Nothing on local disk. Either this is a fresh run, or the session
+        # that produced the last one was wiped — ask the remote store.
+        candidate = output_dir / "checkpoint-remote.pt"
+        if store.pull(remote_checkpoint, candidate):
+            resume = candidate
+            print(f"pulled {remote_checkpoint} from {store.describe()}")
+
     if resume:
-        state = torch.load(resume, map_location=device)
+        state = torch.load(resume, map_location=device, weights_only=False)
         model.load_state_dict(state["model"])
         optimizer.load_state_dict(state["optimizer"])
         scheduler.load_state_dict(state["scheduler"])
         start_step = state["step"]
         print(f"resumed from {resume.name} at step {start_step}")
+    else:
+        print("no checkpoint found — starting from scratch")
 
     history: list[dict] = []
     step = start_step
     started = time.time()
+    last_sync = time.time()
     model.train()
+
+    # Optimiser steps already completed, in micro-batches. Resuming replays
+    # the loader from the top, so this many micro-batches are skipped to land
+    # back where the previous session stopped rather than re-training on data
+    # the model has already seen this epoch.
+    skip_micro_batches = start_step * config.accumulation_steps
 
     oom_skipped = 0
 
+    seen_micro_batches = 0
+
     for epoch in range(config.epochs):
         for i, batch in enumerate(train_loader):
+            # Fast-forward past work the previous session already did.
+            if seen_micro_batches < skip_micro_batches:
+                seen_micro_batches += 1
+                if seen_micro_batches % 5_000 == 0:
+                    print(
+                        f"  skipping ahead {seen_micro_batches:,}/"
+                        f"{skip_micro_batches:,}",
+                        flush=True,
+                    )
+                continue
+            seen_micro_batches += 1
+
             try:
                 with torch.amp.autocast("cuda", enabled=config.fp16 and device == "cuda"):
                     logits = model(
@@ -345,8 +396,19 @@ def train(
                     output_dir / f"checkpoint-{step}.pt",
                 )
                 # Keep only the two newest; Kaggle output is capped at 20 GB.
-                for old in sorted(output_dir.glob("checkpoint-*.pt"))[:-2]:
-                    old.unlink(missing_ok=True)
+                for stale in sorted(output_dir.glob("checkpoint-*.pt"))[:-2]:
+                    if stale.name != "checkpoint-remote.pt":
+                        stale.unlink(missing_ok=True)
+
+                # Push off-machine on an interval, not every checkpoint: the
+                # file is gigabytes and the local copy is already safe against
+                # everything except the session ending.
+                if (time.time() - last_sync) >= config.remote_sync_minutes * 60:
+                    latest = output_dir / f"checkpoint-{step}.pt"
+                    print(f"  syncing step {step} to the remote store…", flush=True)
+                    if store.push(latest, remote_checkpoint):
+                        print(f"  synced at step {step}", flush=True)
+                    last_sync = time.time()
 
             if step % config.eval_every == 0:
                 metrics = evaluate(model, validation_loader, device)
@@ -360,10 +422,14 @@ def train(
     final = evaluate(model, validation_loader, device)
     history.append({**final, "step": step, "final": True})
 
+    final_path = output_dir / "final.pt"
     torch.save(
         {"model": model.state_dict(), "step": step, "config": asdict(config)},
-        output_dir / "final.pt",
+        final_path,
     )
+    # Stage 4 needs this file and nothing else; get it off the machine before
+    # anything can take the session down.
+    store.push(final_path, remote_final)
     (output_dir / "history.json").write_text(json.dumps(history, indent=2), encoding="utf-8")
     (output_dir / "train_config.json").write_text(json.dumps(asdict(config), indent=2), encoding="utf-8")
 

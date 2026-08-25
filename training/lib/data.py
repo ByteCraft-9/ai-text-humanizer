@@ -424,13 +424,31 @@ def build_dataset(
     spec: SampleSpec | None = None,
     include_adversarial: bool = True,
     limit_raid: int | None = None,
+    store=None,
+    reuse: bool = True,
 ) -> pd.DataFrame:
     """Build one training Parquet.
 
     Called twice: once with ``include_adversarial=True`` for Model A, once
     with ``False`` for Model B.
+
+    Sampling and feature extraction take hours, so an existing result is
+    reused rather than rebuilt. The lookup order is local disk, then the
+    remote store, then actually building it — which is what lets a wiped
+    Kaggle session re-run this cell and continue in seconds instead of
+    repeating the whole scan.
     """
     spec = spec or SampleSpec()
+
+    if reuse and output.is_file() and output.stat().st_size > 0:
+        frame = pd.read_parquet(output)
+        print(f"Reusing {output.name}: {len(frame):,} rows already on disk.", flush=True)
+        return frame
+
+    if store is not None and store.pull(output.name, output):
+        frame = pd.read_parquet(output)
+        print(f"Pulled {output.name} from the remote store: {len(frame):,} rows.", flush=True)
+        return frame
 
     def stream() -> Iterator[dict]:
         raid_iter = load_raid(seed=spec.seed, buffer_size=spec.shuffle_buffer)
@@ -456,4 +474,12 @@ def build_dataset(
     output.parent.mkdir(parents=True, exist_ok=True)
     frame.to_parquet(output, index=False)
     print(f"Wrote {output} ({output.stat().st_size >> 20} MB)", flush=True)
+
+    # Get it off the machine immediately. This took hours to produce and the
+    # session can end at any time.
+    if store is not None:
+        print(f"  pushing {output.name} to the remote store…", flush=True)
+        if store.push(output, output.name):
+            print(f"  pushed {output.name}", flush=True)
+
     return frame
