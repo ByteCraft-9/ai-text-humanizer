@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import threading
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -38,7 +39,10 @@ class TrainConfig:
     epochs: int = 3
     weight_decay: float = 0.01
     fp16: bool = True
-    checkpoint_every: int = 500
+    #: Minutes between checkpoints. One save, one upload, nothing duplicated.
+    #: Time-based rather than step-based because what matters is how much work
+    #: a dead session costs, and steps-per-minute varies with sequence length.
+    checkpoint_minutes: float = 20.0
     eval_every: int = 2_000
     seed: int = 20260824
     #: Recompute activations in the backward pass instead of storing them.
@@ -53,11 +57,9 @@ class TrainConfig:
     dynamic_padding: bool = True
     #: Round padded length up to a multiple of this; tensor cores want 8.
     pad_to_multiple_of: int = 8
-    #: Minutes between pushes of the newest checkpoint to the remote store.
-    #: Local checkpoints stay frequent; only the off-machine copy is paced,
-    #: because that one costs bandwidth. At 30 minutes a killed session loses
-    #: at most half an hour of work.
-    remote_sync_minutes: float = 30.0
+    #: Upload on a background thread so training does not stall for the
+    #: minutes a multi-gigabyte transfer takes. Set False to upload inline.
+    background_upload: bool = True
     # Standardisation statistics from the training split; written alongside
     # the checkpoint so inference can use the same ones.
     feature_mean: list[float] | None = None
@@ -137,11 +139,50 @@ def make_collate(tokenizer, pad_to_multiple_of: int = 8):
     return collate
 
 
+#: The single local checkpoint. Overwritten each time and uploaded as-is —
+#: there is no second copy anywhere on this machine.
+CHECKPOINT_NAME = "checkpoint.pt"
+
+
 def _latest_checkpoint(directory: Path) -> Path | None:
-    checkpoints = sorted(directory.glob("checkpoint-*.pt"))
-    if not checkpoints:
+    path = directory / CHECKPOINT_NAME
+    if path.is_file() and path.stat().st_size > 0:
+        return path
+    # Checkpoints written before the single-file layout.
+    legacy = sorted(directory.glob("checkpoint-*.pt"))
+    if not legacy:
         return None
-    return max(checkpoints, key=lambda p: int(p.stem.split("-")[-1]))
+    return max(legacy, key=lambda p: p.stat().st_mtime)
+
+
+_upload_thread: threading.Thread | None = None
+
+
+def _upload_in_background(store: FileStore, local: Path, name: str) -> bool:
+    """Start an upload without blocking training.
+
+    Returns False when a previous upload is still running, in which case this
+    checkpoint is skipped entirely rather than queued — the next one is only
+    `checkpoint_minutes` away, and queueing multi-gigabyte transfers behind
+    each other would only fall further behind.
+    """
+    global _upload_thread
+
+    if _upload_thread is not None and _upload_thread.is_alive():
+        return False
+
+    def work() -> None:
+        store.push(local, name)
+
+    _upload_thread = threading.Thread(target=work, daemon=True, name="ckpt-upload")
+    _upload_thread.start()
+    return True
+
+
+def _wait_for_upload(timeout: float = 900.0) -> None:
+    if _upload_thread is not None and _upload_thread.is_alive():
+        print("  waiting for the in-flight checkpoint upload…", flush=True)
+        _upload_thread.join(timeout)
 
 
 @torch.no_grad()
@@ -384,30 +425,38 @@ def train(
                     flush=True,
                 )
 
-            if step % config.checkpoint_every == 0:
-                torch.save(
-                    {
-                        "model": model.state_dict(),
-                        "optimizer": optimizer.state_dict(),
-                        "scheduler": scheduler.state_dict(),
-                        "step": step,
-                        "config": asdict(config),
-                    },
-                    output_dir / f"checkpoint-{step}.pt",
-                )
-                # Keep only the two newest; Kaggle output is capped at 20 GB.
-                for stale in sorted(output_dir.glob("checkpoint-*.pt"))[:-2]:
-                    if stale.name != "checkpoint-remote.pt":
-                        stale.unlink(missing_ok=True)
-
-                # Push off-machine on an interval, not every checkpoint: the
-                # file is gigabytes and the local copy is already safe against
-                # everything except the session ending.
-                if (time.time() - last_sync) >= config.remote_sync_minutes * 60:
-                    latest = output_dir / f"checkpoint-{step}.pt"
-                    print(f"  syncing step {step} to the remote store…", flush=True)
-                    if store.push(latest, remote_checkpoint):
-                        print(f"  synced at step {step}", flush=True)
+            if (time.time() - last_sync) >= config.checkpoint_minutes * 60:
+                # An upload reads this file, so do not overwrite it while one
+                # is in flight — skip the cycle instead.
+                if _upload_thread is not None and _upload_thread.is_alive():
+                    print(f"  step {step}: previous upload still running, skipping",
+                          flush=True)
+                    last_sync = time.time()
+                else:
+                    checkpoint_path = output_dir / CHECKPOINT_NAME
+                    torch.save(
+                        {
+                            "model": model.state_dict(),
+                            "optimizer": optimizer.state_dict(),
+                            "scheduler": scheduler.state_dict(),
+                            "step": step,
+                            "config": asdict(config),
+                        },
+                        checkpoint_path,
+                    )
+                    size_mb = checkpoint_path.stat().st_size >> 20
+                    if config.background_upload:
+                        started_upload = _upload_in_background(
+                            store, checkpoint_path, remote_checkpoint
+                        )
+                        print(
+                            f"  step {step}: checkpoint {size_mb} MB, "
+                            f"{'uploading in background' if started_upload else 'upload skipped'}",
+                            flush=True,
+                        )
+                    else:
+                        print(f"  step {step}: uploading {size_mb} MB…", flush=True)
+                        store.push(checkpoint_path, remote_checkpoint)
                     last_sync = time.time()
 
             if step % config.eval_every == 0:
@@ -427,9 +476,13 @@ def train(
         {"model": model.state_dict(), "step": step, "config": asdict(config)},
         final_path,
     )
-    # Stage 4 needs this file and nothing else; get it off the machine before
-    # anything can take the session down.
-    store.push(final_path, remote_final)
+
+    # Stage 4 needs this file and nothing else, so this upload blocks — the
+    # run is over and there is no training left to overlap it with.
+    _wait_for_upload()
+    print(f"uploading final.pt ({final_path.stat().st_size >> 20} MB)…", flush=True)
+    if store.push(final_path, remote_final):
+        print(f"final.pt is safe in {store.describe()}")
     (output_dir / "history.json").write_text(json.dumps(history, indent=2), encoding="utf-8")
     (output_dir / "train_config.json").write_text(json.dumps(asdict(config), indent=2), encoding="utf-8")
 

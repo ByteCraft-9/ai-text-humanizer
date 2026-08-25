@@ -182,8 +182,23 @@ Regenerate all six notebooks after editing `build_notebooks.py`:
 python training/build_notebooks.py
 ```
 
-Publish the exports to a public Hugging Face repo (free and unmetered, unlike
-GitHub LFS at 1 GB/month), set `MODEL_REPO` in the Vercel project, redeploy.
+### Surviving a dead session
+
+Kaggle wipes `/kaggle/working` when a session ends or times out, which can
+cost an entire training run. Configure the Drive store in the notebook's store
+cell and the dataset, checkpoints and final model are uploaded as they are
+produced, then pulled back automatically on the next run — recovering means
+running the notebook from the top again, nothing more.
+
+Drive rather than a git-backed store because uploads replace the file in
+place: syncing a 2 GB checkpoint forty times costs 2 GB, where a versioned
+store would keep all forty. There is one local checkpoint, overwritten each
+time, and it is the same file that gets uploaded — no duplicate writes. The
+upload runs on a background thread so training does not stall for it.
+
+Publish the finished exports to a public Hugging Face repo (free and
+unmetered, unlike GitHub LFS at 1 GB/month), set `MODEL_REPO` in the Vercel
+project, redeploy.
 
 **The labelling rule that matters.** RAID ships paraphrase, synonym-swap and
 homoglyph variants of every generation — the humanized-text augmentation, at

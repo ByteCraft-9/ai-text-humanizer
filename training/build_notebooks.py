@@ -94,61 +94,57 @@ if not SMOKE_TEST:
 '''
 
 
-STORE_CELL = '''\
-# ---------------------------------------------------------------------------
-# Where work survives the session ending. Configure this before running.
+STORE_CELL = '''# ---------------------------------------------------------------------------
+# Google Drive — the one place work survives the session ending.
 # ---------------------------------------------------------------------------
 #
-# Kaggle wipes /kaggle/working when a session ends or times out. Without a
-# remote store, a run that dies at hour eight leaves nothing behind. With one,
-# the dataset and the newest checkpoint are pulled back automatically and
-# training continues from the step it reached.
-#
-# Fill in ONE of the two. Leaving both blank runs local-only, which is fine
-# for a smoke test and a bad idea for a real run.
-
-# --- Option A: Google Drive (best for checkpoints) -------------------------
-# Uploads replace the file in place, so syncing a 2 GB checkpoint forty times
-# costs 2 GB rather than 80 GB.
+# Kaggle wipes /kaggle/working when a session ends or times out. Everything
+# expensive — the dataset, the newest checkpoint, the final model — is written
+# once locally and uploaded here. There is no second copy and no second
+# cadence; the file you see on disk is the file that gets uploaded.
 #
 # One-time setup:
 #   1. console.cloud.google.com -> new project -> enable the Drive API
 #   2. Create a service account, then create a JSON key for it
 #   3. In Drive, make a folder and share it with the service account's
-#      client_email (from the JSON) as Editor. A service account has its own
-#      Drive with zero quota, so it can only write into a folder you shared
-#      with it — this is the step people miss.
-#   4. Folder id is the last part of drive.google.com/drive/folders/<THIS>
-#   5. Upload the JSON to Kaggle as a PRIVATE dataset and point at it below
-DRIVE_FOLDER_ID = ""   # e.g. "1AbC..."
-DRIVE_KEY_PATH  = ""   # e.g. "/kaggle/input/gdrive-key/service_account.json"
+#      client_email (found in the JSON) as Editor.
+#      A service account has its own Drive with ZERO quota, so it can only
+#      write into a folder you have shared with it, where the bytes count
+#      against your quota. This is the step people miss, and it fails with a
+#      confusing quota error rather than a permission error.
+#   4. The folder id is the last part of
+#      drive.google.com/drive/folders/<THIS_PART>
+#   5. Upload the JSON key to Kaggle as a PRIVATE dataset, then point at it.
+#      Keep it private: that key can write to the folder you shared.
 
-# --- Option B: Hugging Face Hub (easiest) ----------------------------------
-# Only needs a token: Add-ons -> Secrets -> add one named HF_TOKEN.
-# The Hub is git-backed and keeps every revision, so repeated multi-gigabyte
-# checkpoint pushes accumulate history. Raise remote_sync_minutes if you use
-# this for checkpoints.
-CHECKPOINT_REPO = ""   # e.g. "ByteCraft-9/ai-detector-checkpoints"
+DRIVE_FOLDER_ID = ""   # e.g. "1AbC2dEfGhIjKlMnOpQrStUvWxYz"
+DRIVE_KEY_PATH  = ""   # e.g. "/kaggle/input/gdrive-key/service_account.json"
 
 import os
 
 if DRIVE_FOLDER_ID and DRIVE_KEY_PATH:
     os.environ["DRIVE_FOLDER_ID"] = DRIVE_FOLDER_ID
     os.environ["DRIVE_SERVICE_ACCOUNT_JSON"] = DRIVE_KEY_PATH
-elif CHECKPOINT_REPO:
-    os.environ["CHECKPOINT_REPO"] = CHECKPOINT_REPO
-    try:
-        from kaggle_secrets import UserSecretsClient
-        os.environ["HF_TOKEN"] = UserSecretsClient().get_secret("HF_TOKEN")
-    except Exception as exc:
-        print(f"Could not read the HF_TOKEN secret: {exc}")
 
 from lib.store import build_store
 STORE = build_store()
 
 if STORE.__class__.__name__ == "NullStore":
-    print("\\nNothing will survive this session ending. Fine for a smoke test;"
-          "\\nconfigure a store above before starting a real run.")
+    print("")
+    print("Nothing will survive this session ending. Fine for a smoke test;")
+    print("fill in the two values above before starting a real run.")
+else:
+    # Prove the credentials work now, rather than discovering they do not
+    # eight hours in when the first checkpoint tries to upload.
+    from pathlib import Path
+    probe = Path("/kaggle/working/.drive_probe")
+    probe.write_text("ok")
+    if STORE.push(probe, "_probe.txt") and STORE.pull("_probe.txt", probe):
+        print("Drive write + read verified.")
+    else:
+        print("Drive is NOT working. Check that the folder is shared with the")
+        print("service account's client_email as Editor.")
+    probe.unlink(missing_ok=True)
 '''
 
 

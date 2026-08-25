@@ -5,17 +5,12 @@ eight-hour training run into nothing. Everything that would be expensive to
 recompute therefore gets pushed somewhere that outlives the container, and
 pulled back automatically on the next run.
 
-Two backends, and the choice between them is not obvious:
-
-* **Google Drive** overwrites a file in place, so syncing the same 2 GB
-  checkpoint forty times costs 2 GB. Setup needs a service account.
-* **Hugging Face Hub** needs only a token, but it is git-backed: every push
-  is a new revision and the history keeps every blob. Forty pushes of a 2 GB
-  checkpoint is 80 GB of LFS history. Use a longer sync interval, or
-  `keep_optimizer=False` to push weights only.
-
-Drive is the better fit for frequent checkpointing. The Hub is the better fit
-for the final artefacts, which is what stage 4 already publishes there.
+Google Drive is the one place checkpoints live. Uploads replace the file in
+place, so syncing the same 2 GB checkpoint forty times costs 2 GB rather than
+accumulating a copy per sync — which is why a git-backed store like the
+Hugging Face Hub is the wrong tool for this particular job, and is not offered
+here. Stage 4 still publishes the *finished* models to the Hub; that is a
+handful of files written once.
 
 Every operation is best-effort. A store that cannot reach its backend logs the
 problem and returns False; training continues against local disk, because a
@@ -74,7 +69,9 @@ class NullStore(FileStore):
 
 
 class LocalDirStore(FileStore):
-    """A directory on a mounted volume. Useful for local runs and for tests."""
+    """A plain directory. The test double for GoogleDriveStore, and what a
+    local run uses. Not intended for Kaggle, where local disk is exactly the
+    thing that does not survive."""
 
     def __init__(self, root: str | Path) -> None:
         self.root = Path(root)
@@ -224,101 +221,32 @@ class GoogleDriveStore(FileStore):
         return f"Google Drive folder {self.folder_id}"
 
 
-class HFHubStore(FileStore):
-    """Hugging Face Hub.
-
-    Only needs a token, but it is git-backed: every push is a revision and
-    the history retains every blob. Fine for the handful of final artefacts;
-    for repeated multi-gigabyte checkpoints prefer Drive, or raise the sync
-    interval.
-    """
-
-    def __init__(self, repo_id: str, token: str, repo_type: str = "model") -> None:
-        self.repo_id = repo_id
-        self.token = token
-        self.repo_type = repo_type
-        self._ready = False
-
-    def _ensure(self) -> None:
-        if self._ready:
-            return
-        from huggingface_hub import HfApi
-
-        HfApi(token=self.token).create_repo(
-            self.repo_id, repo_type=self.repo_type, private=True, exist_ok=True
-        )
-        self._ready = True
-
-    def push(self, local: Path, name: str) -> bool:
-        from huggingface_hub import HfApi
-
-        try:
-            self._ensure()
-            HfApi(token=self.token).upload_file(
-                path_or_fileobj=str(local),
-                path_in_repo=name,
-                repo_id=self.repo_id,
-                repo_type=self.repo_type,
-            )
-            return True
-        except Exception as exc:  # noqa: BLE001
-            print(f"  [hf] upload of {name} failed: {exc}", flush=True)
-            return False
-
-    def pull(self, name: str, local: Path) -> bool:
-        from huggingface_hub import hf_hub_download
-
-        try:
-            downloaded = hf_hub_download(
-                repo_id=self.repo_id,
-                filename=name,
-                repo_type=self.repo_type,
-                token=self.token,
-            )
-        except Exception:
-            return False
-
-        local.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(downloaded, local)
-        return True
-
-    def exists(self, name: str) -> bool:
-        from huggingface_hub import HfApi
-
-        try:
-            self._ensure()
-            files = HfApi(token=self.token).list_repo_files(
-                self.repo_id, repo_type=self.repo_type
-            )
-            return name in files
-        except Exception:
-            return False
-
-    def describe(self) -> str:
-        return f"Hugging Face {self.repo_type} repo {self.repo_id}"
-
-
 # ---------------------------------------------------------------------------
 # Construction from the environment
 # ---------------------------------------------------------------------------
 
 
 def build_store(verbose: bool = True) -> FileStore:
-    """Pick a backend from whatever the environment provides.
+    """Build the Drive store from the environment.
 
-    Priority: Drive (cheapest for repeated large writes), then the Hub, then
-    nothing. Configure with:
+        DRIVE_FOLDER_ID                the folder shared with the service account
+        DRIVE_SERVICE_ACCOUNT_JSON     path to the service-account key
 
-        DRIVE_FOLDER_ID + DRIVE_SERVICE_ACCOUNT_JSON   (a path to the key)
-        CHECKPOINT_REPO + HF_TOKEN
-        CHECKPOINT_DIR                                  (a mounted directory)
+    `CHECKPOINT_DIR` selects `LocalDirStore` instead, which exists for tests
+    and offline development rather than for real runs.
     """
     folder = os.environ.get("DRIVE_FOLDER_ID")
     key = os.environ.get("DRIVE_SERVICE_ACCOUNT_JSON")
-    if folder and key and Path(key).is_file():
-        store: FileStore = GoogleDriveStore(folder, key)
-    elif os.environ.get("CHECKPOINT_REPO") and os.environ.get("HF_TOKEN"):
-        store = HFHubStore(os.environ["CHECKPOINT_REPO"], os.environ["HF_TOKEN"])
+
+    if folder and key:
+        if not Path(key).is_file():
+            print(
+                f"DRIVE_SERVICE_ACCOUNT_JSON points at {key}, which does not "
+                f"exist. Checkpoints will not leave this machine."
+            )
+            store: FileStore = NullStore()
+        else:
+            store = GoogleDriveStore(folder, key)
     elif os.environ.get("CHECKPOINT_DIR"):
         store = LocalDirStore(os.environ["CHECKPOINT_DIR"])
     else:
