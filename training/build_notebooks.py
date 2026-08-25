@@ -31,8 +31,14 @@ DEFAULT_GIT_URL = "https://github.com/ByteCraft-9/ai-text-humanizer.git"
 
 SETUP = f'''\
 # Setup. Run once per session — everything below depends on it.
-!pip install -q "transformers>=4.44" "datasets>=2.20" sentencepiece onnx onnxruntime \\
-    "optimum[onnxruntime]" pyarrow google-api-python-client google-auth
+# Version ranges, not open-ended ones. An unbounded "transformers>=4.44"
+# silently upgrades to whatever released since the last session, over the
+# build Kaggle already tested, and DeBERTa-v3 then stops loading with no
+# code change at all. Pinning below 5 keeps a run reproducible.
+!pip install -q "transformers>=4.44,<5" "tokenizers>=0.19,<0.22" \\
+    "datasets>=2.20,<4" sentencepiece onnx onnxruntime \\
+    "optimum[onnxruntime]>=1.20,<2" pyarrow \\
+    google-api-python-client google-auth google-auth-oauthlib
 
 import sys, os
 from pathlib import Path
@@ -64,6 +70,30 @@ MODELS = WORK / "models"; MODELS.mkdir(parents=True, exist_ok=True)
 print("repo:", REPO)
 print("work:", WORK)
 assert (REPO / "training" / "lib").is_dir(), "repo not found — check GIT_URL"
+
+# Preflight the backbone. Stage 2 loads it only after reading 230k rows, so a
+# broken transformers install otherwise surfaces minutes in. Five seconds here.
+import transformers
+from transformers.utils import is_torch_available
+
+print("transformers:", transformers.__version__)
+if not is_torch_available():
+    raise RuntimeError(
+        "transformers cannot see PyTorch, so none of its torch model classes "
+        "are registered. Usually means pip changed torch or transformers "
+        "under a running kernel: restart the session (Run -> Restart Session) "
+        "and run this cell first."
+    )
+try:
+    from transformers import DebertaV2Model  # noqa: F401
+except Exception as exc:
+    raise RuntimeError(
+        f"transformers {{transformers.__version__}} does not expose "
+        f"DebertaV2Model ({{exc}}). If pip upgraded transformers during this "
+        f"session, the running kernel still holds the old one: restart the "
+        f"session and run this cell before anything else."
+    ) from None
+print("DebertaV2Model: available")
 '''
 
 RUN_CONFIG = '''\

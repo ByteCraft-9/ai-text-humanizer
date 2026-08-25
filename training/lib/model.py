@@ -76,7 +76,25 @@ class Detector(nn.Module):
         self.config = config or DetectorConfig()
 
         backbone_config = AutoConfig.from_pretrained(self.config.backbone)
-        self.backbone = AutoModel.from_pretrained(self.config.backbone, config=backbone_config)
+        try:
+            self.backbone = AutoModel.from_pretrained(
+                self.config.backbone, config=backbone_config
+            )
+        except ValueError as exc:
+            # AutoModel reports a missing class as "Could not find XModel in
+            # <module transformers>", which reads like a corrupt install but
+            # almost always means transformers was upgraded to a version that
+            # no longer exports it, or was changed under a running kernel.
+            import transformers
+
+            raise RuntimeError(
+                f"transformers {transformers.__version__} could not build "
+                f"{self.config.backbone}: {exc}. "
+                f"This is an environment problem, not a data or config one. "
+                f"Pin transformers below 5 and restart the kernel — an "
+                f"upgrade under a running session leaves the old module "
+                f"loaded and the new one on disk."
+            ) from None
         hidden = backbone_config.hidden_size
 
         self.feature_attention = FeatureAttention(
