@@ -95,36 +95,45 @@ if not SMOKE_TEST:
 
 
 STORE_CELL = '''# ---------------------------------------------------------------------------
-# Google Drive — the one place work survives the session ending.
+# Google Drive - the one place work survives the session ending.
 # ---------------------------------------------------------------------------
 #
 # Kaggle wipes /kaggle/working when a session ends or times out. Everything
-# expensive — the dataset, the newest checkpoint, the final model — is written
+# expensive - the dataset, the newest checkpoint, the final model - is written
 # once locally and uploaded here. There is no second copy and no second
 # cadence; the file you see on disk is the file that gets uploaded.
 #
-# One-time setup:
+# Use OAuth, NOT a service account. A service account has no Drive storage of
+# its own and would own anything it creates, so uploads fail with
+# "Service Accounts do not have storage quota" however the folder is shared.
+# Google's suggested workarounds need Google Workspace. Authorising as
+# yourself makes the files yours, counted against your own quota.
+#
+# One-time setup, on a machine with a browser (not here):
 #   1. console.cloud.google.com -> new project -> enable the Drive API
-#   2. Create a service account, then create a JSON key for it
-#   3. In Drive, make a folder and share it with the service account's
-#      client_email (found in the JSON) as Editor.
-#      A service account has its own Drive with ZERO quota, so it can only
-#      write into a folder you have shared with it, where the bytes count
-#      against your quota. This is the step people miss, and it fails with a
-#      confusing quota error rather than a permission error.
-#   4. The folder id is the last part of
-#      drive.google.com/drive/folders/<THIS_PART>
-#   5. Upload the JSON key to Kaggle as a PRIVATE dataset, then point at it.
-#      Keep it private: that key can write to the folder you shared.
+#   2. APIs & Services -> OAuth consent screen -> External.
+#      Set publishing status to "In production". While it says "Testing",
+#      Google expires the refresh token after 7 days and saving would stop
+#      working mid-run. No verification review is needed, because the only
+#      scope requested is drive.file, which is not a sensitive scope.
+#   3. Credentials -> Create OAuth client ID -> Desktop app -> download JSON
+#   4. Run, from a clone of this repo:
+#        pip install google-auth-oauthlib google-api-python-client
+#        python scripts/drive_auth.py --client-secret client_secret.json
+#      It opens a browser, then writes drive_token.json and creates the Drive
+#      folder for you.
+#   5. Upload drive_token.json to Kaggle as a PRIVATE dataset, and point at it
+#      below. Keep it private: it can write to that folder.
 
-DRIVE_FOLDER_ID = ""   # e.g. "1AbC2dEfGhIjKlMnOpQrStUvWxYz"
-DRIVE_KEY_PATH  = ""   # e.g. "/kaggle/input/gdrive-key/service_account.json"
+DRIVE_KEY_PATH = ""   # e.g. "/kaggle/input/drive-token/drive_token.json"
 
 import os
 
-if DRIVE_FOLDER_ID and DRIVE_KEY_PATH:
-    os.environ["DRIVE_FOLDER_ID"] = DRIVE_FOLDER_ID
+if DRIVE_KEY_PATH:
     os.environ["DRIVE_SERVICE_ACCOUNT_JSON"] = DRIVE_KEY_PATH
+    # The folder id is recorded inside drive_token.json, so there is nothing
+    # else to fill in. Override here only for a different folder.
+    # os.environ["DRIVE_FOLDER_ID"] = "..."
 
 from lib.store import build_store
 STORE = build_store()
@@ -132,7 +141,7 @@ STORE = build_store()
 if STORE.__class__.__name__ == "NullStore":
     print("")
     print("Nothing will survive this session ending. Fine for a smoke test;")
-    print("fill in the two values above before starting a real run.")
+    print("set DRIVE_KEY_PATH above before starting a real run.")
 else:
     # Prove the credentials work now, rather than discovering they do not
     # eight hours in when the first checkpoint tries to upload.
@@ -140,10 +149,9 @@ else:
     probe = Path("/kaggle/working/.drive_probe")
     probe.write_text("ok")
     if STORE.push(probe, "_probe.txt") and STORE.pull("_probe.txt", probe):
-        print("Drive write + read verified.")
+        print("Drive write + read verified - checkpoints will survive.")
     else:
-        print("Drive is NOT working. Check that the folder is shared with the")
-        print("service account's client_email as Editor.")
+        print("Drive is NOT working. The message above says why.")
     probe.unlink(missing_ok=True)
 '''
 

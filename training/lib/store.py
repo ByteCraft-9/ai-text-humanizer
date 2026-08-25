@@ -105,43 +105,109 @@ class LocalDirStore(FileStore):
         return f"local directory {self.root}"
 
 
+SERVICE_ACCOUNT_QUOTA_HELP = """
+Google refused the upload: service accounts have no Drive storage of their own.
+
+A file created by a service account is owned by that service account, not by
+you, so your personal quota never comes into it — and sharing one of your
+folders with the service account does not change ownership. Google's suggested
+workarounds, Shared Drives and domain-wide delegation, both require Google
+Workspace and are unavailable to a personal @gmail.com account.
+
+Authorise as yourself instead. Run this once on a machine with a browser:
+
+    pip install google-auth-oauthlib google-api-python-client
+    python scripts/drive_auth.py --client-secret client_secret.json
+
+That writes drive_token.json. Upload it to Kaggle as a private dataset and
+point DRIVE_KEY_PATH at it. Files will then be owned by you and counted
+against your own storage.
+"""
+
+
 class GoogleDriveStore(FileStore):
-    """Google Drive, via a service account.
+    """Google Drive.
 
     Uploads replace the file in place rather than adding a revision, so
     repeatedly syncing a large checkpoint does not accumulate storage.
 
-    Setting this up, once:
+    Takes either credential file, and works out which from its contents:
 
-    1. Google Cloud Console → create a project → enable the **Drive API**.
-    2. Create a **service account**, then create a **JSON key** for it.
-    3. In Google Drive, make a folder and **share it with the service
-       account's email** (the `client_email` in the JSON) as **Editor**.
-       This step is what people miss: a service account has its own Drive
-       with zero quota, so it can only write into a folder you have shared
-       with it, where the bytes count against *your* quota.
-    4. Take the folder id from its URL:
-       `drive.google.com/drive/folders/<THIS_PART>`.
-    5. Upload the JSON key to Kaggle as a **private Dataset**, or paste it
-       into Kaggle **Add-ons → Secrets**.
+    * **OAuth user credentials** (``drive_token.json`` from
+      ``scripts/drive_auth.py``) — the one that works for a personal Google
+      account. Files are owned by you and count against your quota.
+    * **A service-account key** — only usable against a Google Workspace
+      Shared Drive. Against a personal My Drive folder every upload fails with
+      ``storageQuotaExceeded`` no matter how the folder is shared, because the
+      service account would own the file and has no quota.
     """
 
-    def __init__(self, folder_id: str, service_account_json: str | Path) -> None:
+    def __init__(self, folder_id: str, credentials_json: str | Path) -> None:
         self.folder_id = folder_id
-        self._key = str(service_account_json)
+        self._key = str(credentials_json)
         self._service = None
+        self._warned_quota = False
+
+    def _credentials(self):
+        import json as _json
+
+        with open(self._key, encoding="utf-8") as handle:
+            data = _json.load(handle)
+
+        if data.get("type") == "service_account":
+            from google.oauth2 import service_account
+
+            return service_account.Credentials.from_service_account_file(
+                self._key, scopes=["https://www.googleapis.com/auth/drive"]
+            ), True
+
+        if not data.get("refresh_token"):
+            raise RuntimeError(
+                f"{self._key} is neither a service-account key nor OAuth user "
+                f"credentials. Regenerate it with scripts/drive_auth.py."
+            )
+
+        from google.auth.transport.requests import Request
+        from google.oauth2.credentials import Credentials
+
+        credentials = Credentials(
+            token=None,
+            refresh_token=data["refresh_token"],
+            client_id=data["client_id"],
+            client_secret=data["client_secret"],
+            token_uri="https://oauth2.googleapis.com/token",
+            scopes=data.get("scopes") or ["https://www.googleapis.com/auth/drive.file"],
+        )
+        # Refresh eagerly so an expired grant is reported here, with a usable
+        # message, rather than inside the first checkpoint upload.
+        credentials.refresh(Request())
+        return credentials, False
 
     def _client(self):
         if self._service is not None:
             return self._service
-        from google.oauth2 import service_account
         from googleapiclient.discovery import build
 
-        credentials = service_account.Credentials.from_service_account_file(
-            self._key, scopes=["https://www.googleapis.com/auth/drive"]
-        )
+        credentials, is_service_account = self._credentials()
+        self._is_service_account = is_service_account
         self._service = build("drive", "v3", credentials=credentials, cache_discovery=False)
         return self._service
+
+    def _explain(self, exc: Exception) -> None:
+        """Turn Google's generic 403 into the actual cause, once."""
+        text = str(exc)
+        if "storageQuota" in text or "storage quota" in text:
+            if not self._warned_quota:
+                print(SERVICE_ACCOUNT_QUOTA_HELP, flush=True)
+                self._warned_quota = True
+        elif "File not found" in text or "notFound" in text:
+            print(
+                f"  [drive] folder {self.folder_id} is not visible to these "
+                f"credentials. With the drive.file scope only folders this app "
+                f"created are reachable — use the folder id that "
+                f"scripts/drive_auth.py printed, not one made in the web UI.",
+                flush=True,
+            )
 
     def _find(self, name: str) -> str | None:
         escaped = name.replace("'", "\\'")
@@ -157,6 +223,7 @@ class GoogleDriveStore(FileStore):
             )
         except Exception as exc:  # noqa: BLE001
             print(f"  [drive] lookup failed for {name}: {exc}", flush=True)
+            self._explain(exc)
             return None
         files = result.get("files", [])
         return files[0]["id"] if files else None
@@ -187,6 +254,7 @@ class GoogleDriveStore(FileStore):
             return True
         except Exception as exc:  # noqa: BLE001
             print(f"  [drive] upload of {name} failed: {exc}", flush=True)
+            self._explain(exc)
             return False
 
     def pull(self, name: str, local: Path) -> bool:
@@ -211,6 +279,7 @@ class GoogleDriveStore(FileStore):
             return True
         except Exception as exc:  # noqa: BLE001
             print(f"  [drive] download of {name} failed: {exc}", flush=True)
+            self._explain(exc)
             staging.unlink(missing_ok=True)
             return False
 
@@ -229,14 +298,27 @@ class GoogleDriveStore(FileStore):
 def build_store(verbose: bool = True) -> FileStore:
     """Build the Drive store from the environment.
 
-        DRIVE_FOLDER_ID                the folder shared with the service account
-        DRIVE_SERVICE_ACCOUNT_JSON     path to the service-account key
+        DRIVE_SERVICE_ACCOUNT_JSON     path to drive_token.json
+        DRIVE_FOLDER_ID                optional; read from the token otherwise
 
     `CHECKPOINT_DIR` selects `LocalDirStore` instead, which exists for tests
     and offline development rather than for real runs.
     """
     folder = os.environ.get("DRIVE_FOLDER_ID")
     key = os.environ.get("DRIVE_SERVICE_ACCOUNT_JSON")
+
+    # drive_auth.py records the folder it created, so the notebook only has to
+    # supply one value.
+    if key and not folder and Path(key).is_file():
+        try:
+            import json as _json
+
+            with open(key, encoding="utf-8") as handle:
+                folder = _json.load(handle).get("folder_id")
+            if folder:
+                print(f"using folder {folder} from {Path(key).name}")
+        except Exception:
+            folder = None
 
     if folder and key:
         if not Path(key).is_file():

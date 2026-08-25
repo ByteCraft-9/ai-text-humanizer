@@ -25,3 +25,7 @@ models/*
 public/pdf.worker.min.mjs
 
 .DS_Store
+
+# Google Drive OAuth token — grants write access to your Drive folder
+drive_token.json
+client_secret*.json
