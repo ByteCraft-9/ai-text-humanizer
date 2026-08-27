@@ -322,7 +322,7 @@ print(json.dumps(stats, indent=2)[:900])
 
 TRAIN_CELL = '''\
 import pandas as pd
-from lib.data import FEATURE_NAMES
+from lib.data import FEATURE_NAMES, pick_holdout_domains
 from lib.train import TrainConfig, train
 
 frame___TAG__ = pd.read_parquet(DATA / "train___TAG__.parquet")
@@ -331,7 +331,12 @@ frame___TAG__ = pd.read_parquet(DATA / "train___TAG__.parquet")
 # a generator's quirks and score well on rows from the same generator, which
 # is precisely the overfitting RAID exposed (E3: fine-tuned RoBERTa-Large
 # averaged 56.7%).
-holdout___TAG__ = sorted(frame___TAG__["domain"].unique())[-2:]
+#
+# The domains are chosen for containing BOTH classes. Taking the last two
+# alphabetically can land on a split that is entirely AI, and then every
+# validation metric is NaN and the run is unmeasurable — which the training
+# loss will not show you, because that is computed on the training batches.
+holdout___TAG__ = pick_holdout_domains(frame___TAG__)
 validation___TAG__ = frame___TAG__[frame___TAG__["domain"].isin(holdout___TAG__)]
 training___TAG__ = frame___TAG__[~frame___TAG__["domain"].isin(holdout___TAG__)]
 print(f"train {len(training___TAG__):,} · validate {len(validation___TAG__):,} "
@@ -347,11 +352,16 @@ config___TAG__ = TrainConfig(
     fp16=True,
 )
 
-# Checkpoints land in WORK/model___TAG__ every 500 steps, and every
-# remote_sync_minutes the newest one is pushed to STORE. On startup this looks
-# for a local checkpoint, then a remote one, and fast-forwards to the step it
-# reached — so if the session dies, run the notebook from the top again and
-# training picks up where it stopped.
+# Checkpoints go to WORK/model___TAG__ and to STORE every checkpoint_minutes.
+# On startup this looks for a local checkpoint, then a remote one, and
+# fast-forwards to the step it reached — so if the session dies, run the
+# notebook from the top again and training continues from there.
+#
+# Stopping early is safe and supported. Interrupt the cell whenever the loss
+# has flattened: the interrupt is caught, final.pt is written and uploaded
+# from wherever training got to, and stage 4 will export it like any completed
+# run. Even a hard kill is fine — stage 4 falls back to the checkpoint, which
+# carries the same weights.
 model___TAG__, report___TAG__ = train(
     training___TAG__, validation___TAG__, list(FEATURE_NAMES),
     output_dir=WORK / "model___TAG__",
@@ -393,12 +403,27 @@ STAGE2_CELLS = [
     code(TRAIN_CELL.replace("__TAG__", "a")),
     code('''\
 # Progress against the criteria this stage can measure (PRD 14).
-final = report_a["final"]
-print(f"AUROC            {final['auroc']:.4f}   (A1 needs >= 0.95 on the test split)")
-print(f"partial AUROC@5% {final['partial_auroc_5']:.4f}")
-print(f"TPR @ 1% FPR     {final['tpr_at_1_fpr']:.4f}   (A3 needs >= 0.80 on essays)")
-print(f"TPR @ 5% FPR     {final['tpr_at_5_fpr']:.4f}   (A5 needs >= 0.90 on humanized AI)")
-print("\\nValidation-split numbers. The binding evaluation is stage 5.")
+if report_a.get("interrupted"):
+    print(f"Stopped early at step {report_a['step']:,}. final.pt was written and")
+    print("uploaded, so stage 4 can export it like any completed run.")
+    print("")
+    print("The final evaluation pass was skipped - it costs minutes and you")
+    print("asked to stop. Most recent periodic eval:")
+    evals = [h for h in report_a["history"] if "auroc" in h]
+    final = evals[-1] if evals else {}
+    if not evals:
+        print("  none ran yet - eval_every was never reached")
+else:
+    final = report_a["final"]
+
+if final:
+    print(f"step             {final.get('step', report_a.get('step', 0)):,}")
+    print(f"AUROC            {final['auroc']:.4f}   (A1 needs >= 0.95 on the test split)")
+    print(f"partial AUROC@5% {final['partial_auroc_5']:.4f}")
+    print(f"TPR @ 1% FPR     {final['tpr_at_1_fpr']:.4f}   (A3 needs >= 0.80 on essays)")
+    print(f"TPR @ 5% FPR     {final['tpr_at_5_fpr']:.4f}   (A5 needs >= 0.90 on humanized AI)")
+    print("")
+    print("Validation-split numbers. The binding evaluation is stage 5.")
 '''),
 ]
 
@@ -422,13 +447,30 @@ STAGE3_CELLS = [
 # Sanity check on what B is *for*. It should be clearly weaker than A on
 # humanized text — that gap is the product's honesty margin, and the two
 # numbers the UI shows are exactly this difference made visible.
-final_b = report_b["final"]
-print(f"Model B  AUROC {final_b['auroc']:.4f}  ·  TPR@1%FPR {final_b['tpr_at_1_fpr']:.4f}")
+def latest_metrics(report):
+    """The final eval if the run completed, else the newest periodic one."""
+    if not report.get("interrupted") and "auroc" in report.get("final", {}):
+        return report["final"]
+    evals = [h for h in report.get("history", []) if "auroc" in h]
+    return evals[-1] if evals else None
+
+if report_b.get("interrupted"):
+    print(f"Stopped early at step {report_b['step']:,}; final.pt was written.")
+
+metrics_b = latest_metrics(report_b)
+if metrics_b:
+    print(f"Model B  AUROC {metrics_b['auroc']:.4f}  ·  "
+          f"TPR@1%FPR {metrics_b['tpr_at_1_fpr']:.4f}")
+else:
+    print("Model B  no evaluation has run yet")
+
 try:
-    print(f"Model A  AUROC {report_a['final']['auroc']:.4f}  ·  "
-          f"TPR@1%FPR {report_a['final']['tpr_at_1_fpr']:.4f}")
+    metrics_a = latest_metrics(report_a)
+    if metrics_a:
+        print(f"Model A  AUROC {metrics_a['auroc']:.4f}  ·  "
+              f"TPR@1%FPR {metrics_a['tpr_at_1_fpr']:.4f}")
 except NameError:
-    print("(Model A not in this session — compare against stage 2's output.)")
+    print("(Model A not in this session - compare against stage 2's output.)")
 print("\\nIf B matches A on adversarial text it is not a surrogate for anything.")
 print("Stage 5 measures that gap directly.")
 '''),
@@ -464,18 +506,13 @@ from lib.data import FEATURE_NAMES
 from lib.export import (check_parity, export_onnx, export_tokenizer,
                         quantize, report_sizes, write_manifest)
 from lib.model import Detector, DetectorConfig
+from lib.train import load_trained_state
 
 def load(tag):
-    path = WORK / f"model_{tag}" / "final.pt"
-    if not path.is_file():
-        # A wiped session loses /kaggle/working; training pushed this file to
-        # the store precisely so stage 4 does not require retraining.
-        STORE.pull(f"model_{tag}-final.pt", path)
-    assert path.is_file(), (
-        f"{path} missing and not in the store — run stage "
-        f"{'2' if tag == 'a' else '3'} first"
-    )
-    state = torch.load(path, map_location="cpu")
+    # Takes final.pt or a checkpoint, local or from the store, whichever holds
+    # the most training — a checkpoint carries the same weights, so a run that
+    # was stopped early exports exactly like one that finished.
+    state = load_trained_state(WORK / f"model_{tag}", STORE, f"model_{tag}")
     cfg = state["config"]
     model = Detector(DetectorConfig(backbone=cfg["backbone"], max_length=cfg["max_length"]))
     model.load_state_dict(state["model"])

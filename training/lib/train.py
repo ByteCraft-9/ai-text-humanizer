@@ -60,6 +60,11 @@ class TrainConfig:
     #: Upload on a background thread so training does not stall for the
     #: minutes a multi-gigabyte transfer takes. Set False to upload inline.
     background_upload: bool = True
+    #: Refuse to start when the validation split holds only one class. Every
+    #: metric would be NaN and the run would be unmeasurable, which is not
+    #: visible in the training loss. Set False only to train deliberately
+    #: blind.
+    require_validation: bool = True
     # Standardisation statistics from the training split; written alongside
     # the checkpoint so inference can use the same ones.
     feature_mean: list[float] | None = None
@@ -153,6 +158,56 @@ def _latest_checkpoint(directory: Path) -> Path | None:
     if not legacy:
         return None
     return max(legacy, key=lambda p: p.stat().st_mtime)
+
+
+def load_trained_state(
+    output_dir: Path,
+    store: FileStore | None = None,
+    tag: str | None = None,
+) -> dict:
+    """Return the newest usable model state, from wherever it exists.
+
+    A checkpoint carries everything ``final.pt`` does — weights, step, config —
+    plus optimiser state. So a run stopped part way is still a usable model,
+    and stage 4 should never demand that training ran to completion.
+
+    Local sources are compared by step rather than by preference: a session
+    that died mid-upload can leave local disk ahead of the remote copy, and
+    silently taking the older one would throw away real training.
+    """
+    tag = tag or output_dir.name
+    candidates: list[tuple[int, Path]] = []
+
+    for name in ("final.pt", CHECKPOINT_NAME):
+        path = output_dir / name
+        if not (path.is_file() and path.stat().st_size > 0):
+            continue
+        try:
+            state = torch.load(path, map_location="cpu", weights_only=False)
+        except Exception as exc:  # noqa: BLE001
+            print(f"  {name} is unreadable ({exc}); ignoring it")
+            continue
+        candidates.append((int(state.get("step", 0)), path))
+
+    if candidates:
+        step, path = max(candidates, key=lambda item: item[0])
+        print(f"using {path.name} from step {step:,}")
+        return torch.load(path, map_location="cpu", weights_only=False)
+
+    if store is not None:
+        for remote in (f"{tag}-final.pt", f"{tag}-checkpoint.pt"):
+            local = output_dir / "pulled.pt"
+            if store.pull(remote, local):
+                state = torch.load(local, map_location="cpu", weights_only=False)
+                print(f"pulled {remote} from the store, step {state.get('step', 0):,}")
+                return state
+
+    raise FileNotFoundError(
+        f"No usable weights for {tag}. Looked for final.pt and "
+        f"{CHECKPOINT_NAME} in {output_dir}, then in the store. Run the "
+        f"training stage for {tag} first — stopping it early is fine, the "
+        f"checkpoint is enough."
+    )
 
 
 _upload_thread: threading.Thread | None = None
@@ -275,6 +330,21 @@ def train(
     config.feature_mean = feature_mean.tolist()
     config.feature_std = feature_std.tolist()
 
+    positive_share = float(validation_frame["label"].mean())
+    if config.require_validation and not 0.0 < positive_share < 1.0:
+        raise ValueError(
+            f"The validation split is entirely "
+            f"{'AI' if positive_share else 'human'} "
+            f"({len(validation_frame):,} rows, {positive_share:.3f} positive), "
+            f"so every metric would be NaN and this run could not be measured "
+            f"at all. Each evaluation would also cost minutes to produce "
+            f"nothing.\n\n"
+            f"Use lib.data.pick_holdout_domains(frame) to choose domains that "
+            f"contain both classes, or pass "
+            f"TrainConfig(require_validation=False) to train blind on purpose."
+        )
+    print(f"validation: {len(validation_frame):,} rows, {positive_share:.3f} positive")
+
     tokenizer = AutoTokenizer.from_pretrained(config.backbone)
     model = Detector(DetectorConfig(backbone=config.backbone, max_length=config.max_length))
 
@@ -359,117 +429,132 @@ def train(
     oom_skipped = 0
 
     seen_micro_batches = 0
+    interrupted = False
 
-    for epoch in range(config.epochs):
-        for i, batch in enumerate(train_loader):
-            # Fast-forward past work the previous session already did.
-            if seen_micro_batches < skip_micro_batches:
-                seen_micro_batches += 1
-                if seen_micro_batches % 5_000 == 0:
-                    print(
-                        f"  skipping ahead {seen_micro_batches:,}/"
-                        f"{skip_micro_batches:,}",
-                        flush=True,
-                    )
-                continue
-            seen_micro_batches += 1
-
-            try:
-                with torch.amp.autocast("cuda", enabled=config.fp16 and device == "cuda"):
-                    logits = model(
-                        batch["input_ids"].to(device),
-                        batch["attention_mask"].to(device),
-                        batch["features"].to(device),
-                    )
-                    loss = criterion(logits, batch["label"].to(device)) / config.accumulation_steps
-
-                scaler.scale(loss).backward()
-            except torch.cuda.OutOfMemoryError:
-                # One unusually long batch must not end an eight-hour run.
-                # Drop it, reclaim, carry on — but stop if it keeps happening,
-                # because then the configuration genuinely does not fit.
-                oom_skipped += 1
-                optimizer.zero_grad(set_to_none=True)
-                del batch
-                torch.cuda.empty_cache()
-                if oom_skipped > 25:
-                    raise RuntimeError(
-                        f"Ran out of GPU memory {oom_skipped} times — this "
-                        f"configuration does not fit. Halve batch_size to "
-                        f"{max(1, config.batch_size // 2)} and double "
-                        f"accumulation_steps to {config.accumulation_steps * 2} "
-                        f"to keep the same effective batch, or lower "
-                        f"max_length from {config.max_length}."
-                    ) from None
-                if oom_skipped % 5 == 1:
-                    print(f"  OOM on one batch (skipped {oom_skipped} so far)", flush=True)
-                continue
-
-            if (i + 1) % config.accumulation_steps != 0:
-                continue
-
-            scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            scaler.step(optimizer)
-            scaler.update()
-            optimizer.zero_grad(set_to_none=True)
-            scheduler.step()
-            step += 1
-
-            if step % 50 == 0:
-                elapsed = time.time() - started
-                print(
-                    f"epoch {epoch} step {step}/{total_steps} "
-                    f"loss {loss.item() * config.accumulation_steps:.4f} "
-                    f"({elapsed / 60:.1f} min)",
-                    flush=True,
-                )
-
-            if (time.time() - last_sync) >= config.checkpoint_minutes * 60:
-                # An upload reads this file, so do not overwrite it while one
-                # is in flight — skip the cycle instead.
-                if _upload_thread is not None and _upload_thread.is_alive():
-                    print(f"  step {step}: previous upload still running, skipping",
-                          flush=True)
-                    last_sync = time.time()
-                else:
-                    checkpoint_path = output_dir / CHECKPOINT_NAME
-                    torch.save(
-                        {
-                            "model": model.state_dict(),
-                            "optimizer": optimizer.state_dict(),
-                            "scheduler": scheduler.state_dict(),
-                            "step": step,
-                            "config": asdict(config),
-                        },
-                        checkpoint_path,
-                    )
-                    size_mb = checkpoint_path.stat().st_size >> 20
-                    if config.background_upload:
-                        started_upload = _upload_in_background(
-                            store, checkpoint_path, remote_checkpoint
-                        )
+    try:
+        for epoch in range(config.epochs):
+            for i, batch in enumerate(train_loader):
+                # Fast-forward past work the previous session already did.
+                if seen_micro_batches < skip_micro_batches:
+                    seen_micro_batches += 1
+                    if seen_micro_batches % 5_000 == 0:
                         print(
-                            f"  step {step}: checkpoint {size_mb} MB, "
-                            f"{'uploading in background' if started_upload else 'upload skipped'}",
+                            f"  skipping ahead {seen_micro_batches:,}/"
+                            f"{skip_micro_batches:,}",
                             flush=True,
                         )
-                    else:
-                        print(f"  step {step}: uploading {size_mb} MB…", flush=True)
-                        store.push(checkpoint_path, remote_checkpoint)
-                    last_sync = time.time()
+                    continue
+                seen_micro_batches += 1
 
-            if step % config.eval_every == 0:
-                metrics = evaluate(model, validation_loader, device)
-                metrics["step"] = step
-                history.append(metrics)
-                print(f"  eval {metrics}", flush=True)
+                try:
+                    with torch.amp.autocast("cuda", enabled=config.fp16 and device == "cuda"):
+                        logits = model(
+                            batch["input_ids"].to(device),
+                            batch["attention_mask"].to(device),
+                            batch["features"].to(device),
+                        )
+                        loss = criterion(logits, batch["label"].to(device)) / config.accumulation_steps
+
+                    scaler.scale(loss).backward()
+                except torch.cuda.OutOfMemoryError:
+                    # One unusually long batch must not end an eight-hour run.
+                    # Drop it, reclaim, carry on — but stop if it keeps happening,
+                    # because then the configuration genuinely does not fit.
+                    oom_skipped += 1
+                    optimizer.zero_grad(set_to_none=True)
+                    del batch
+                    torch.cuda.empty_cache()
+                    if oom_skipped > 25:
+                        raise RuntimeError(
+                            f"Ran out of GPU memory {oom_skipped} times — this "
+                            f"configuration does not fit. Halve batch_size to "
+                            f"{max(1, config.batch_size // 2)} and double "
+                            f"accumulation_steps to {config.accumulation_steps * 2} "
+                            f"to keep the same effective batch, or lower "
+                            f"max_length from {config.max_length}."
+                        ) from None
+                    if oom_skipped % 5 == 1:
+                        print(f"  OOM on one batch (skipped {oom_skipped} so far)", flush=True)
+                    continue
+
+                if (i + 1) % config.accumulation_steps != 0:
+                    continue
+
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                scaler.step(optimizer)
+                scaler.update()
+                optimizer.zero_grad(set_to_none=True)
+                scheduler.step()
+                step += 1
+
+                if step % 50 == 0:
+                    elapsed = time.time() - started
+                    print(
+                        f"epoch {epoch} step {step}/{total_steps} "
+                        f"loss {loss.item() * config.accumulation_steps:.4f} "
+                        f"({elapsed / 60:.1f} min)",
+                        flush=True,
+                    )
+
+                if (time.time() - last_sync) >= config.checkpoint_minutes * 60:
+                    # An upload reads this file, so do not overwrite it while one
+                    # is in flight — skip the cycle instead.
+                    if _upload_thread is not None and _upload_thread.is_alive():
+                        print(f"  step {step}: previous upload still running, skipping",
+                              flush=True)
+                        last_sync = time.time()
+                    else:
+                        checkpoint_path = output_dir / CHECKPOINT_NAME
+                        torch.save(
+                            {
+                                "model": model.state_dict(),
+                                "optimizer": optimizer.state_dict(),
+                                "scheduler": scheduler.state_dict(),
+                                "step": step,
+                                "config": asdict(config),
+                            },
+                            checkpoint_path,
+                        )
+                        size_mb = checkpoint_path.stat().st_size >> 20
+                        if config.background_upload:
+                            started_upload = _upload_in_background(
+                                store, checkpoint_path, remote_checkpoint
+                            )
+                            print(
+                                f"  step {step}: checkpoint {size_mb} MB, "
+                                f"{'uploading in background' if started_upload else 'upload skipped'}",
+                                flush=True,
+                            )
+                        else:
+                            print(f"  step {step}: uploading {size_mb} MB…", flush=True)
+                            store.push(checkpoint_path, remote_checkpoint)
+                        last_sync = time.time()
+
+                if step % config.eval_every == 0:
+                    metrics = evaluate(model, validation_loader, device)
+                    metrics["step"] = step
+                    history.append(metrics)
+                    print(f"  eval {metrics}", flush=True)
+
+    except KeyboardInterrupt:
+        # Stopping early is a legitimate way to end a run — the loss may have
+        # flattened, or the GPU budget may be gone. Fall through to the same
+        # save path a completed run takes, so the notebook keeps working and
+        # stage 4 has something to export.
+        interrupted = True
+        print(f"\n\nInterrupted at step {step:,}. Saving what has trained.", flush=True)
 
     if oom_skipped:
         print(f"\n{oom_skipped} batch(es) were skipped on out-of-memory.")
 
-    final = evaluate(model, validation_loader, device)
-    history.append({**final, "step": step, "final": True})
+    if interrupted:
+        # A full evaluation pass costs minutes. Someone who just hit stop is
+        # not waiting for it.
+        final = {"interrupted_at_step": step}
+    else:
+        final = evaluate(model, validation_loader, device)
+        history.append({**final, "step": step, "final": True})
 
     final_path = output_dir / "final.pt"
     torch.save(
@@ -487,4 +572,10 @@ def train(
     (output_dir / "train_config.json").write_text(json.dumps(asdict(config), indent=2), encoding="utf-8")
 
     print(f"\nfinal: {final}")
-    return model, {"history": history, "final": final, "config": asdict(config)}
+    return model, {
+        "history": history,
+        "final": final,
+        "config": asdict(config),
+        "interrupted": interrupted,
+        "step": step,
+    }

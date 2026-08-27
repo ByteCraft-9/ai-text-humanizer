@@ -41,6 +41,7 @@ __all__ = [
     "SampleSpec",
     "add_features",
     "build_dataset",
+    "pick_holdout_domains",
     "load_dactyl",
     "load_raid",
     "stratified_sample",
@@ -380,6 +381,89 @@ def stratified_sample(
             "MIN_WORDS/MAX_WORDS are not excluding everything."
         )
     return frame
+
+
+def pick_holdout_domains(
+    frame: pd.DataFrame,
+    n: int = 2,
+    min_class_share: float = 0.15,
+    min_rows: int = 200,
+    max_holdout_share: float = 0.25,
+) -> list[str]:
+    """Choose holdout domains that actually contain both classes.
+
+    Taking the last two domains alphabetically is how a run ends up validating
+    against a split that is entirely AI or entirely human — every metric comes
+    back NaN and the training is flying blind, which is not obvious from the
+    loss curve because the loss is computed on the training batches.
+
+    Domains are ranked by how balanced they are, then by size, and the
+    selection stops before the holdout swallows more than `max_holdout_share`
+    of the data.
+    """
+    stats = frame.groupby("domain")["label"].agg(["mean", "count"])
+    usable = stats[
+        (stats["mean"] >= min_class_share)
+        & (stats["mean"] <= 1.0 - min_class_share)
+        & (stats["count"] >= min_rows)
+    ]
+
+    if usable.empty:
+        report = stats.sort_values("mean").to_string()
+        raise ValueError(
+            "No domain contains a usable mix of both classes, so there is "
+            "nothing to validate against. Per-domain positive rate and row "
+            f"count:\n{report}\n\n"
+            "Hold out by generator instead, or rebuild the dataset so at "
+            "least one domain carries both human and AI rows."
+        )
+
+    # Domains within a few points of each other are equally good for
+    # validation, so bucket the balance and let size break the tie. Sorting on
+    # raw balance would pick the single best-balanced domain first and then
+    # find nothing else fits the budget, leaving a one-domain holdout that
+    # cannot show cross-domain generalisation at all.
+    balance = (usable["mean"] - 0.5).abs()
+    ranked = usable.assign(
+        balance=balance, band=(balance / 0.05).round()
+    ).sort_values(["band", "count"], ascending=[True, True])
+
+    budget = len(frame) * max_holdout_share
+    chosen: list[str] = []
+    held = 0
+    for domain, row in ranked.iterrows():
+        if len(chosen) >= n:
+            break
+        # The budget applies to the first pick too. Exempting it is how a
+        # single dominant domain ends up as a 98% holdout, leaving almost
+        # nothing to train on.
+        if held + row["count"] > budget:
+            continue
+        chosen.append(str(domain))
+        held += int(row["count"])
+
+    if not chosen:
+        # Every usable domain is individually larger than the budget. Take the
+        # smallest rather than nothing, and say what it costs.
+        smallest = ranked.sort_values("count").index[0]
+        chosen = [str(smallest)]
+        held = int(ranked.loc[smallest, "count"])
+        print(
+            f"warning: the smallest domain with both classes is {smallest} at "
+            f"{held:,} rows, which is {held / len(frame):.0%} of the data. "
+            f"Validation will be reliable but training loses that much."
+        )
+
+    print(
+        f"holdout domains: {sorted(chosen)} "
+        f"({held:,} rows, {held / len(frame):.1%} of the data)"
+    )
+    for domain in chosen:
+        print(
+            f"  {domain}: {int(stats.loc[domain, 'count']):,} rows, "
+            f"{stats.loc[domain, 'mean']:.3f} positive"
+        )
+    return sorted(chosen)
 
 
 # ---------------------------------------------------------------------------
